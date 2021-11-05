@@ -55,7 +55,7 @@ impl PingSocketBuilder {
         self.socket.bind_device(interface)
     }
 
-    #[cfg(all(feature = "all", any(target_os = "freebsd")))]
+    #[cfg(target_os = "freebsd")]
     pub fn set_fib(&self, fib:u32) -> io::Result<()> {
         self.socket.set_fib(fib)
     }
