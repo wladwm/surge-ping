@@ -1,22 +1,20 @@
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
     io,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use log::trace;
+use log::{trace, warn};
 use parking_lot::Mutex;
 use rand::random;
-use tokio::task;
-use tokio::time::timeout;
 use tokio::sync::mpsc::Receiver;
-
+use tokio::time::timeout;
 
 use crate::error::{Result, SurgeError};
-use crate::icmp::{icmpv4, IcmpPacket, icmpv6};
-use crate::pingsocket::{AsyncSocket,PingResponse};
+use crate::icmp::{icmpv4, icmpv6, IcmpPacket};
+use crate::pingsocket::{AsyncSocket, PingResponse};
 
 type Token = (u16, u16);
 
@@ -65,16 +63,20 @@ pub struct Pinger {
     timeout: Duration,
     socket: AsyncSocket,
     rx: Receiver<PingResponse>,
-    cache: Cache
+    cache: Cache,
 }
 
 impl Pinger {
     /// Creates a new Ping instance from `IpAddr`.
-    #[deprecated(note="Use the pingsocket::PingSocketBuilder::build as Pinger constructor")]
+    #[deprecated(note = "Use the pingsocket::PingSocketBuilder::build as Pinger constructor")]
     pub fn new(host: IpAddr) -> io::Result<Pinger> {
-      crate::pingsocket::PingSocket::create_pinger(host)
+        crate::pingsocket::PingSocket::create_pinger(host)
     }
-    pub(crate) fn new_pinger(host: IpAddr,socket: AsyncSocket,rx: Receiver<PingResponse>) -> Pinger {
+    pub(crate) fn new_pinger(
+        host: IpAddr,
+        socket: AsyncSocket,
+        rx: Receiver<PingResponse>,
+    ) -> Pinger {
         Pinger {
             destination: host,
             ident: random(),
@@ -83,7 +85,7 @@ impl Pinger {
             timeout: Duration::from_secs(2),
             socket,
             rx,
-            cache: Cache::new()
+            cache: Cache::new(),
         }
     }
 
@@ -115,14 +117,23 @@ impl Pinger {
             let response = self.rx.recv().await.ok_or(SurgeError::NetworkError)?;
             let packet = match self.destination {
                 IpAddr::V4(_) => icmpv4::Icmpv4Packet::decode(&response.packet).map(IcmpPacket::V4),
-                IpAddr::V6(a) => icmpv6::Icmpv6Packet::decode(&response.packet, a).map(IcmpPacket::V6),
+                IpAddr::V6(a) => {
+                    icmpv6::Icmpv6Packet::decode(&response.packet, a).map(IcmpPacket::V6)
+                }
             };
             match packet {
                 Ok(packet) => {
                     if packet.check_reply_packet(self.destination, seq_cnt, self.ident) {
                         if let Some(ins) = self.cache.remove(self.ident, seq_cnt) {
                             return Ok((packet, response.when - ins));
+                        } else {
+                            warn!(
+                                "Invalid reply ident {} {} {}",
+                                self.destination, self.ident, seq_cnt
+                            );
                         }
+                    } else {
+                        warn!("Invalid reply {:?}", packet);
                     }
                 }
                 Err(SurgeError::EchoRequestPacket) => continue,
@@ -142,12 +153,11 @@ impl Pinger {
         let sock_addr = SocketAddr::new(self.destination, 0);
         let ident = self.ident;
         let cache = self.cache.clone();
-        task::spawn(async move {
-            if let Err(e) = sender.send_to(&mut packet, &sock_addr).await {
-                trace!("socket send packet error: {}", e)
-            }
-            cache.insert(ident, seq_cnt, Instant::now());
-        });
+        cache.insert(ident, seq_cnt, Instant::now());
+        if let Err(e) = sender.send_to(&mut packet, &sock_addr).await {
+            trace!("socket send packet error: {}", e);
+            return Err(SurgeError::IOError(e));
+        }
 
         match timeout(self.timeout, self.recv_reply(seq_cnt)).await {
             Ok(reply) => reply.map_err(|err| {
@@ -161,4 +171,3 @@ impl Pinger {
         }
     }
 }
-

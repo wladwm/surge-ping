@@ -5,27 +5,30 @@ use crate::ping::Pinger;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::Mutex;
-use std::time::Instant;
 
 #[cfg(unix)]
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 
+const DEFAULT_LIMIT_PPS: usize = 10000;
+
 pub(crate) struct PingResponse {
     pub when: Instant,
-    pub packet: Vec<u8>
+    pub packet: Vec<u8>,
 }
 impl PingResponse {
-    pub fn new(when:Instant,packet:Vec<u8>) -> PingResponse {
-        PingResponse{when,packet}
+    pub fn new(when: Instant, packet: Vec<u8>) -> PingResponse {
+        PingResponse { when, packet }
     }
 }
 pub struct PingSocketBuilder {
     socket: Socket,
+    send_limit_pps: usize,
 }
 impl PingSocketBuilder {
     pub fn new(d: Domain) -> io::Result<PingSocketBuilder> {
@@ -48,7 +51,10 @@ impl PingSocketBuilder {
         // https://tools.ietf.org/html/rfc3542#section-4, to show the TTL for
         // ICMPv6.
         socket.set_nonblocking(true)?;
-        Ok(PingSocketBuilder { socket })
+        Ok(PingSocketBuilder {
+            socket,
+            send_limit_pps: DEFAULT_LIMIT_PPS,
+        })
     }
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     pub fn bind_device(&self, interface: Option<&[u8]>) -> io::Result<()> {
@@ -56,7 +62,7 @@ impl PingSocketBuilder {
     }
 
     #[cfg(target_os = "freebsd")]
-    pub fn set_fib(&self, fib:u32) -> io::Result<()> {
+    pub fn set_fib(&self, fib: u32) -> io::Result<()> {
         self.socket.set_fib(fib)
     }
 
@@ -66,6 +72,11 @@ impl PingSocketBuilder {
 
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
         self.socket.set_ttl(ttl)
+    }
+
+    pub fn set_send_limit_pps(&mut self, limit: usize) -> io::Result<()> {
+        self.send_limit_pps = limit;
+        Ok(())
     }
 
     pub fn set_send_buffer_size(&self, bufsize: usize) -> io::Result<()> {
@@ -87,18 +98,89 @@ impl PingSocketBuilder {
     }
 
     pub fn build(self) -> io::Result<PingSocket> {
-        PingSocket::new_socket(AsyncSocket::new(self.inner_run()?))
+        let limit = self.send_limit_pps;
+        PingSocket::new_socket(AsyncSocket::new(self.inner_run()?, limit))
     }
 }
-
+struct LimitBasket {
+    last: Option<Instant>,
+    cnt: usize,
+    limit_pps: usize,
+    minwait_time: Duration,
+}
+impl LimitBasket {
+    fn new(limit_pps: usize) -> LimitBasket {
+        LimitBasket {
+            last: None,
+            cnt: 0,
+            limit_pps,
+            minwait_time: Duration::from_millis(1),
+        }
+    }
+    async fn shot(&mut self) {
+        let mut nw = Instant::now();
+        match self.last {
+            None => {
+                self.last = Some(nw);
+                self.cnt = 1;
+                return;
+            }
+            Some(l) => {
+                let elapsed = (nw - l).as_secs_f64();
+                let mut sub_pps = ((self.limit_pps as f64) * elapsed).trunc();
+                if sub_pps < 0f64 {
+                    sub_pps = 0f64;
+                }
+                let sub_pps = sub_pps as usize;
+                if self.cnt <= sub_pps {
+                    self.cnt = 0;
+                } else {
+                    self.cnt -= sub_pps;
+                }
+                if self.cnt > 0 {
+                    let wd = Duration::from_secs_f64((self.cnt as f64) / (self.limit_pps as f64));
+                    if wd >= self.minwait_time {
+                        tokio::time::sleep(wd).await;
+                        self.cnt = 0;
+                        nw = Instant::now();
+                    }
+                }
+                self.cnt += 1;
+                self.last = Some(nw);
+            }
+        }
+    }
+}
+struct InnerSocket {
+    socket: UdpSocket,
+    limit: Mutex<LimitBasket>,
+}
+impl InnerSocket {
+    fn new(socket: UdpSocket, send_limit_pps: usize) -> Self {
+        InnerSocket {
+            socket,
+            limit: Mutex::new(LimitBasket::new(send_limit_pps)),
+        }
+    }
+    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.socket.recv_from(buf).await
+    }
+    pub async fn send_to(&self, buf: &mut [u8], target: &SocketAddr) -> io::Result<usize> {
+        {
+            let mut limit_guard = self.limit.lock().await;
+            limit_guard.shot().await;
+        };
+        self.socket.send_to(buf, target).await
+    }
+}
 #[derive(Clone)]
 pub(crate) struct AsyncSocket {
-    inner: Arc<UdpSocket>,
+    inner: Arc<InnerSocket>,
 }
 impl AsyncSocket {
-    fn new(socket: UdpSocket) -> Self {
+    fn new(socket: UdpSocket, send_limit_pps: usize) -> Self {
         AsyncSocket {
-            inner: Arc::new(socket),
+            inner: Arc::new(InnerSocket::new(socket, send_limit_pps)),
         }
     }
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -131,7 +213,10 @@ impl PingSocket {
             IpAddr::V4(_) => socket2::Domain::IPV4,
             IpAddr::V6(_) => socket2::Domain::IPV6,
         };
-        let inner = AsyncSocket::new(PingSocketBuilder::new(domain)?.inner_run()?);
+        let inner = AsyncSocket::new(
+            PingSocketBuilder::new(domain)?.inner_run()?,
+            DEFAULT_LIMIT_PPS,
+        );
         let mut pmap = BTreeMap::<IpAddr, Sender<PingResponse>>::new();
         let recv_task = Arc::new(Mutex::new(None));
         let (tx, rx) = channel(100);
@@ -155,7 +240,10 @@ impl PingSocket {
                     Some(tx) => tx,
                 };
                 //let btosend = unsafe { assume_init(&buffer[0..sz]) }.to_vec();
-                if tx.try_send(PingResponse::new(received,buffer[0..sz].to_vec())).is_err() {
+                if tx
+                    .try_send(PingResponse::new(received, buffer[0..sz].to_vec()))
+                    .is_err()
+                {
                     pmapguard.remove(&from_addr.ip());
                     if pmapguard.len() < 1 {
                         break;
